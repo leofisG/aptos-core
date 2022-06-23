@@ -1341,6 +1341,7 @@ dependencies = [
  "proptest",
  "proptest-derive",
  "rand 0.7.3",
+ "rayon",
  "schemadb",
  "scratchpad",
  "serde 1.0.137",
@@ -7069,6 +7070,7 @@ name = "schemadb"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aptos-infallible",
  "aptos-logger",
  "aptos-metrics-core",
  "aptos-temppath",
