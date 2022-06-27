@@ -46,6 +46,13 @@ struct Args {
     wait_millis: u64,
     #[structopt(long)]
     burst: bool,
+
+    /// The transaction emitter will submit no more than this many transactions
+    /// per second. So if max TPS is 1600 and there are 16 workers, each worker
+    /// will submit no more than 100 per second each.
+    #[structopt(long, default_value = "100000")]
+    max_tps: u64,
+
     #[structopt(long, default_value = "30")]
     txn_expiration_time_secs: u64,
     #[structopt(long, default_value = "mint.key")]
@@ -110,6 +117,7 @@ async fn emit_tx(cluster: &Cluster, args: &Args) -> Result<()> {
             .accounts_per_client(args.accounts_per_client)
             .thread_params(thread_params)
             .invalid_transaction_ratio(args.invalid_tx)
+            .max_tps(args.max_tps)
             .gas_price(1);
     if let Some(workers_per_endpoint) = args.workers_per_ac {
         emit_job_request = emit_job_request.workers_per_endpoint(workers_per_endpoint);
@@ -118,7 +126,7 @@ async fn emit_tx(cluster: &Cluster, args: &Args) -> Result<()> {
         emit_job_request = emit_job_request.vasp();
     }
     let stats = emitter
-        .emit_txn_for_with_stats(duration, emit_job_request, 10)
+        .emit_txn_for_with_stats(duration, emit_job_request, min(10, args.duration))
         .await?;
     println!("Total stats: {}", stats);
     println!("Average rate: {}", stats.rate(duration));
