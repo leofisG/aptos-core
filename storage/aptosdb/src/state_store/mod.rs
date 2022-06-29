@@ -38,7 +38,7 @@ use aptos_types::{
 use once_cell::sync::Lazy;
 use rayon::prelude::*;
 use schemadb::{ReadOptions, SchemaBatch, DB};
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{cell::RefCell, collections::HashMap, sync::Arc, time::Instant};
 use storage_interface::{DbReader, StateSnapshotReceiver};
 
 type LeafNode = aptos_jellyfish_merkle::node_type::LeafNode<StateKey>;
@@ -68,6 +68,10 @@ pub static PROOF_READ: Lazy<Histogram> =
 pub static VALUE_READ: Lazy<Histogram> =
     Lazy::new(|| register_histogram!("value_read", "value read latency.").unwrap());
 
+thread_local! {
+    static COUNT: RefCell<u64> = RefCell::new(0);
+}
+
 #[derive(Debug)]
 pub struct StateStore {
     ledger_db: Arc<DB>,
@@ -86,16 +90,10 @@ impl DbReader for StateStore {
         &self,
         state_key: &StateKey,
         version: Version,
-        counter: &mut Option<&mut [u128]>,
-        latency: &mut Option<&mut [u128]>,
     ) -> Result<(Option<StateValue>, SparseMerkleProof)> {
         let t = Instant::now();
-        let (leaf_data, proof) = JellyfishMerkleTree::new(self).get_with_proof(
-            state_key.hash(),
-            version,
-            counter,
-            latency,
-        )?;
+        let (leaf_data, proof) =
+            JellyfishMerkleTree::new(self).get_with_proof(state_key.hash(), version)?;
         PROOF_READ.observe(t.elapsed().as_secs_f64() * 1000000000.0);
         let r = Ok((
             match leaf_data {
@@ -474,31 +472,41 @@ impl StateStore {
 
 impl TreeReader<StateKey> for StateStore {
     fn get_node_option(&self, node_key: &NodeKey) -> Result<Option<Node>> {
+        let mut count = false;
+        /*
+        COUNT.with(|c| {
+            *c.borrow_mut() += 1;
+            if *c.borrow() % 262144 == 0 {
+                println!("version_cache_hit: {} {}, lru_cache: {}, {}, version_cache_miss: {}, {}, cache_miss_total: {}, {}",
+                    VERSION_CACHE.get_sample_count(), VERSION_CACHE.get_sample_sum() / VERSION_CACHE.get_sample_count() as f64, LRU_CACHE.get_sample_count(), LRU_CACHE.get_sample_sum() / LRU_CACHE.get_sample_count() as f64, CACHE_MISS_READ.get_sample_count(), CACHE_MISS_READ.get_sample_sum() / CACHE_MISS_READ.get_sample_count() as f64, CACHE_MISS_TOTAL.get_sample_count(), CACHE_MISS_TOTAL.get_sample_sum() / CACHE_MISS_TOTAL.get_sample_count() as f64);
+                println!(
+                    "proof read: {} {}, value read: {} {}",
+                    PROOF_READ.get_sample_count(),
+                    PROOF_READ.get_sample_sum() / PROOF_READ.get_sample_count() as f64,
+                    VALUE_READ.get_sample_count(),
+                    VALUE_READ.get_sample_sum() / VALUE_READ.get_sample_count() as f64
+                );
+            }
+            if *c.borrow() % 16 == 0 {
+                count = true;
+            }
+        });*/
         let mut t = Instant::now();
-        if (VERSION_CACHE.get_sample_count()
-            + LRU_CACHE.get_sample_count()
-            + CACHE_MISS_TOTAL.get_sample_count())
-        .checked_rem(131072)
-            == Some(0)
-        {
-            println!("version_cache_hit: {} {}, lru_cache: {}, {}, version_cache_miss: {}, {}, cache_miss_total: {}, {}",
-                VERSION_CACHE.get_sample_count(), VERSION_CACHE.get_sample_sum() / VERSION_CACHE.get_sample_count() as f64, LRU_CACHE.get_sample_count(), LRU_CACHE.get_sample_sum() / LRU_CACHE.get_sample_count() as f64, CACHE_MISS_READ.get_sample_count(), CACHE_MISS_READ.get_sample_sum() / CACHE_MISS_READ.get_sample_count() as f64, CACHE_MISS_TOTAL.get_sample_count(), CACHE_MISS_TOTAL.get_sample_sum() / CACHE_MISS_TOTAL.get_sample_count() as f64);
-            println!(
-                "proof read: {} {}, value read: {} {}",
-                PROOF_READ.get_sample_count(),
-                PROOF_READ.get_sample_sum() / PROOF_READ.get_sample_count() as f64,
-                VALUE_READ.get_sample_count(),
-                VALUE_READ.get_sample_sum() / VALUE_READ.get_sample_count() as f64
-            );
-        }
         let node_opt = if let Some(node_cache) = self.version_cache.get_version(node_key.version())
         {
+            if count {
+                VERSION_CACHE.observe(t.elapsed().as_secs_f64() * 1000000000.0);
+            }
             node_cache.get(node_key).cloned()
         } else {
-            CACHE_MISS_READ.observe(t.elapsed().as_secs_f64() * 1000000000.0);
+            if count {
+                CACHE_MISS_READ.observe(t.elapsed().as_secs_f64() * 1000000000.0);
+            }
             t = Instant::now();
             if let Some(node) = self.lru_cache.get(node_key) {
-                LRU_CACHE.observe(t.elapsed().as_secs_f64() * 1000000000.0);
+                if count {
+                    LRU_CACHE.observe(t.elapsed().as_secs_f64() * 1000000000.0);
+                }
                 Some(node)
             } else {
                 let node_opt = self
@@ -507,7 +515,9 @@ impl TreeReader<StateKey> for StateStore {
                 if let Some(node) = &node_opt {
                     self.lru_cache.put(node_key.clone(), node.clone());
                 }
-                CACHE_MISS_TOTAL.observe(t.elapsed().as_secs_f64() * 1000000000.0);
+                if count {
+                    CACHE_MISS_TOTAL.observe(t.elapsed().as_secs_f64() * 1000000000.0);
+                }
                 node_opt
             }
         };
